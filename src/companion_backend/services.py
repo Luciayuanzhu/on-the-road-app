@@ -56,7 +56,7 @@ def format_log_fields(**fields) -> str:
 
 def log_live(event: str, **fields) -> None:
     details = format_log_fields(**fields)
-    logger.info("%s%s", event, f" {details}" if details else "")
+    logger.warning("%s%s", event, f" {details}" if details else "")
 
 
 class ApiError(Exception):
