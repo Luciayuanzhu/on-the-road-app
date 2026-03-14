@@ -5,6 +5,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import perf_counter
 from typing import Any
 from uuid import uuid4
 
@@ -47,6 +48,15 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def format_log_fields(**fields) -> str:
+    return " ".join(f"{key}={value!r}" for key, value in fields.items())
+
+
+def log_live(event: str, **fields) -> None:
+    details = format_log_fields(**fields)
+    logger.info("%s%s", event, f" {details}" if details else "")
 
 
 class ApiError(Exception):
@@ -594,21 +604,49 @@ class GeminiLiveBridge:
             self.http_session = None
 
     async def refresh_if_active(self, session_id: str) -> None:
+        refresh_started = perf_counter()
+        log_live("LIVE_GEMINI_REFRESH_BEGIN", session_id=session_id)
         try:
             await self.ensure_session(session_id)
         except Exception as exc:
-            logger.warning("Gemini Live refresh degraded for session %s: %s", session_id, type(exc).__name__)
+            logger.warning(
+                "LIVE_GEMINI_REFRESH_FAIL %s",
+                format_log_fields(
+                    session_id=session_id,
+                    error_type=type(exc).__name__,
+                    duration_ms=int((perf_counter() - refresh_started) * 1000),
+                ),
+            )
             return
+        log_live(
+            "LIVE_GEMINI_REFRESH_OK",
+            session_id=session_id,
+            duration_ms=int((perf_counter() - refresh_started) * 1000),
+        )
 
     async def restart_session(self, session_id: str) -> None:
         if not self.enabled:
             return
+        restart_started = perf_counter()
+        log_live("LIVE_GEMINI_RESTART_BEGIN", session_id=session_id)
         await self.close_session(session_id)
         try:
             await self.ensure_session(session_id)
         except Exception as exc:
-            logger.warning("Gemini Live restart degraded for session %s: %s", session_id, type(exc).__name__)
+            logger.warning(
+                "LIVE_GEMINI_RESTART_FAIL %s",
+                format_log_fields(
+                    session_id=session_id,
+                    error_type=type(exc).__name__,
+                    duration_ms=int((perf_counter() - restart_started) * 1000),
+                ),
+            )
             return
+        log_live(
+            "LIVE_GEMINI_RESTART_OK",
+            session_id=session_id,
+            duration_ms=int((perf_counter() - restart_started) * 1000),
+        )
 
     async def ensure_session(self, session_id: str) -> GeminiLiveConnection | None:
         if not self.enabled:
@@ -617,19 +655,32 @@ class GeminiLiveBridge:
         prompt_state = self.session_service.prompt_state(session_id)
         existing = self.connections.get(session_id)
         if existing is not None and not existing.ws.closed and existing.prompt_state == prompt_state:
+            log_live("LIVE_GEMINI_SESSION_REUSED", session_id=session_id)
             return existing
         if existing is not None:
+            log_live("LIVE_GEMINI_SESSION_REPLACED", session_id=session_id)
             await self.close_session(session_id)
         return await self._connect(session_id, prompt_state)
 
     async def _connect(self, session_id: str, prompt_state: str) -> GeminiLiveConnection:
         if self.http_session is None:
             raise RuntimeError("Gemini live client session is not initialized")
+        connect_started = perf_counter()
+        log_live(
+            "LIVE_GEMINI_CONNECT_BEGIN",
+            session_id=session_id,
+            prompt_chars=len(prompt_state),
+        )
         ws = await self.http_session.ws_connect(
             self.config.gemini_live_ws_url,
             headers={"x-goog-api-key": self.config.gemini_api_key or ""},
             heartbeat=30,
             receive_timeout=None,
+        )
+        log_live(
+            "LIVE_GEMINI_CONNECT_OK",
+            session_id=session_id,
+            duration_ms=int((perf_counter() - connect_started) * 1000),
         )
         setup_complete = asyncio.Event()
         connection = GeminiLiveConnection(
@@ -654,7 +705,25 @@ class GeminiLiveBridge:
                 }
             }
         )
-        await asyncio.wait_for(setup_complete.wait(), timeout=10)
+        setup_wait_started = perf_counter()
+        log_live("LIVE_GEMINI_SETUP_WAIT_BEGIN", session_id=session_id)
+        try:
+            await asyncio.wait_for(setup_complete.wait(), timeout=10)
+        except Exception as exc:
+            logger.warning(
+                "LIVE_GEMINI_SETUP_WAIT_FAIL %s",
+                format_log_fields(
+                    session_id=session_id,
+                    error_type=type(exc).__name__,
+                    duration_ms=int((perf_counter() - setup_wait_started) * 1000),
+                ),
+            )
+            raise
+        log_live(
+            "LIVE_GEMINI_SETUP_WAIT_OK",
+            session_id=session_id,
+            duration_ms=int((perf_counter() - setup_wait_started) * 1000),
+        )
         latest_frame = self.session_service.latest_image_frame(session_id)
         if latest_frame is not None and self.session_service.is_visual_assist_active(session_id):
             await ws.send_json(
@@ -678,13 +747,17 @@ class GeminiLiveBridge:
                     continue
                 data = message.json()
                 if data.get("setupComplete") == {} or "setupComplete" in data:
+                    log_live("LIVE_GEMINI_SETUP_COMPLETE_RECEIVED", session_id=session_id)
                     connection.setup_complete.set()
                     continue
                 server_content = data.get("serverContent")
                 if server_content:
                     await self._handle_server_content(session_id, connection, server_content)
         except Exception as exc:
-            logger.warning("Gemini Live reader closed for session %s: %s", session_id, type(exc).__name__)
+            logger.warning(
+                "LIVE_GEMINI_READER_CLOSED %s",
+                format_log_fields(session_id=session_id, error_type=type(exc).__name__),
+            )
             pass
         finally:
             if connection.audio_end_task is not None:

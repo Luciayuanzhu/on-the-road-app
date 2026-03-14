@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import logging
+from time import perf_counter
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -55,9 +57,20 @@ SUMMARY_SERVICE_KEY = web.AppKey("summary_service", SummaryService)
 BOOKMARK_SERVICE_KEY = web.AppKey("bookmark_service", BookmarkService)
 LIVE_BRIDGE_KEY = web.AppKey("live_bridge", GeminiLiveBridge)
 
+logger = logging.getLogger(__name__)
+
 
 def model_json(model) -> dict:
     return model.model_dump(mode="json", by_alias=True)
+
+
+def format_log_fields(**fields) -> str:
+    return " ".join(f"{key}={value!r}" for key, value in fields.items())
+
+
+def log_live(event: str, **fields) -> None:
+    details = format_log_fields(**fields)
+    logger.info("%s%s", event, f" {details}" if details else "")
 
 
 @web.middleware
@@ -111,6 +124,14 @@ async def create_session(request: web.Request) -> web.Response:
         response.session_id,
         request.app[CONFIG_KEY].public_base_url,
     )
+    log_live(
+        "LIVE_SESSION_CREATE",
+        request_id=request["request_id"],
+        session_id=response.session_id,
+        user_id=payload.user_id,
+        device_id=payload.device_id,
+        status=response.status.value,
+    )
     return web.json_response(model_json(response), status=201)
 
 
@@ -163,86 +184,182 @@ async def live_session(request: web.Request) -> web.StreamResponse:
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
 
+    request_id = request["request_id"]
     session_id = request.match_info["session_id"]
+    ws_id = uuid4().hex[:8]
     live_manager: LiveSessionManager = request.app[LIVE_MANAGER_KEY]
     await live_manager.register(session_id, ws)
     session_service: SessionService = request.app[SESSION_SERVICE_KEY]
     live_bridge: GeminiLiveBridge = request.app[LIVE_BRIDGE_KEY]
 
+    log_live(
+        "LIVE_WS_OPEN",
+        request_id=request_id,
+        session_id=session_id,
+        ws_id=ws_id,
+        remote=request.remote,
+        ua=request.headers.get("User-Agent", ""),
+        open_connections=len(live_manager.connections.get(session_id, set())),
+    )
+
+    async def send_ws_event(event_type: str, payload: dict, **extra_fields) -> None:
+        send_started = perf_counter()
+        log_live(
+            "LIVE_WS_SEND_BEGIN",
+            request_id=request_id,
+            session_id=session_id,
+            ws_id=ws_id,
+            ws_event=event_type,
+            **extra_fields,
+        )
+        try:
+            await ws.send_json({"type": event_type, "payload": payload})
+        except Exception as exc:
+            logger.exception(
+                "LIVE_WS_SEND_FAIL %s",
+                format_log_fields(
+                    request_id=request_id,
+                    session_id=session_id,
+                    ws_id=ws_id,
+                    ws_event=event_type,
+                    error_type=type(exc).__name__,
+                    **extra_fields,
+                ),
+            )
+            raise
+        log_live(
+            "LIVE_WS_SEND_OK",
+            request_id=request_id,
+            session_id=session_id,
+            ws_id=ws_id,
+            ws_event=event_type,
+            duration_ms=int((perf_counter() - send_started) * 1000),
+            **extra_fields,
+        )
+
     try:
         async for message in ws:
+            message_type = getattr(message.type, "name", str(message.type))
+            if isinstance(message.data, str):
+                message_bytes = len(message.data.encode("utf-8"))
+            elif isinstance(message.data, (bytes, bytearray)):
+                message_bytes = len(message.data)
+            else:
+                message_bytes = 0
+            log_live(
+                "LIVE_WS_FRAME_IN",
+                request_id=request_id,
+                session_id=session_id,
+                ws_id=ws_id,
+                aiohttp_type=message_type,
+                bytes=message_bytes,
+            )
             if message.type != WSMsgType.TEXT:
+                log_live(
+                    "LIVE_WS_FRAME_IGNORED",
+                    request_id=request_id,
+                    session_id=session_id,
+                    ws_id=ws_id,
+                    aiohttp_type=message_type,
+                )
                 continue
 
             try:
                 envelope = WebsocketEnvelope.model_validate_json(message.data)
             except ValidationError as exc:
-                await ws.send_json(
-                    {"type": "error", "payload": {"code": "BAD_REQUEST", "message": exc.errors()[0]["msg"]}}
+                log_live(
+                    "LIVE_WS_ENVELOPE_ERROR",
+                    request_id=request_id,
+                    session_id=session_id,
+                    ws_id=ws_id,
+                    error_type=type(exc).__name__,
+                )
+                await send_ws_event(
+                    "error",
+                    {"code": "BAD_REQUEST", "message": exc.errors()[0]["msg"]},
+                    error_code="BAD_REQUEST",
                 )
                 continue
 
             event_type = envelope.type
             payload = envelope.payload
             now = datetime.now(UTC)
+            log_live(
+                "LIVE_WS_ENVELOPE_OK",
+                request_id=request_id,
+                session_id=session_id,
+                ws_id=ws_id,
+                ws_event=event_type,
+            )
 
             try:
                 if event_type == "session.start":
                     parsed = parse_payload(SessionStartPayload, payload)
+                    start_started = perf_counter()
+                    log_live(
+                        "LIVE_SESSION_START_BEGIN",
+                        request_id=request_id,
+                        session_id=session_id,
+                        ws_id=ws_id,
+                        user_id=parsed.user_id,
+                        device_id=parsed.device_id,
+                        payload_session_id=parsed.session_id,
+                    )
                     session_service.start(parsed.session_id, parsed.user_id, parsed.device_id)
-                    await ws.send_json(
-                        {
-                            "type": "session.status",
-                            "payload": model_json(SessionStatusPayload(status=SessionStatus.active)),
-                        }
+                    log_live(
+                        "LIVE_SESSION_START_OK",
+                        request_id=request_id,
+                        session_id=session_id,
+                        ws_id=ws_id,
+                        db_status=SessionStatus.active.value,
+                        duration_ms=int((perf_counter() - start_started) * 1000),
+                    )
+                    await send_ws_event(
+                        "session.status",
+                        model_json(SessionStatusPayload(status=SessionStatus.active)),
+                        status=SessionStatus.active.value,
                     )
                     await live_bridge.refresh_if_active(session_id)
                 elif event_type == "session.update_settings":
                     parsed = parse_payload(SessionUpdateSettingsPayload, payload)
                     hint = await session_service.update_settings(session_id, parsed.settings)
-                    await ws.send_json({"type": "context.hint", "payload": model_json(hint)})
+                    await send_ws_event("context.hint", model_json(hint))
                     await live_bridge.restart_session(session_id)
                 elif event_type == "location.update":
                     parsed = parse_payload(LocationUpdatePayload, payload)
                     assistant_text, hint = await session_service.update_location(session_id, parsed)
-                    await ws.send_json({"type": "context.hint", "payload": model_json(hint)})
+                    await send_ws_event("context.hint", model_json(hint))
                     await live_bridge.refresh_if_active(session_id)
                     if assistant_text:
                         session_service.record_assistant_text(session_id, assistant_text, parsed.timestamp)
-                        await ws.send_json(
+                        await send_ws_event(
+                            "assistant.transcript",
                             {
-                                "type": "assistant.transcript",
-                                "payload": {
-                                    "text": assistant_text,
-                                    "isFinal": True,
-                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                                },
-                            }
+                                "text": assistant_text,
+                                "isFinal": True,
+                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                            },
                         )
-                        await ws.send_json(
+                        await send_ws_event(
+                            "assistant.audio.chunk",
                             {
-                                "type": "assistant.audio.chunk",
-                                "payload": {
-                                    "mimeType": "audio/pcm",
-                                    "data": generate_silence_chunk(),
-                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                                },
-                            }
+                                "mimeType": "audio/pcm",
+                                "data": generate_silence_chunk(),
+                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                            },
                         )
                 elif event_type == "destination.update":
                     parsed = parse_payload(Destination, payload) if payload is not None else None
                     assistant_text = await session_service.update_destination(session_id, parsed)
                     await live_bridge.restart_session(session_id)
                     session_service.record_assistant_text(session_id, assistant_text, now)
-                    await ws.send_json(
+                    await send_ws_event(
+                        "assistant.transcript",
                         {
-                            "type": "assistant.transcript",
-                            "payload": {
-                                "text": assistant_text,
-                                "isFinal": True,
-                                "timestamp": now.isoformat().replace("+00:00", "Z"),
-                            },
-                        }
+                            "text": assistant_text,
+                            "isFinal": True,
+                            "timestamp": now.isoformat().replace("+00:00", "Z"),
+                        },
                     )
                 elif event_type == "text.input":
                     parsed = parse_payload(TextInputPayload, payload)
@@ -258,15 +375,13 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                         # established or write-path fails. This keeps text and audio on the same
                         # real-time source whenever Live is healthy.
                         session_service.record_user_text(session_id, parsed.text, parsed.timestamp)
-                        await ws.send_json(
+                        await send_ws_event(
+                            "user.transcript",
                             {
-                                "type": "user.transcript",
-                                "payload": {
-                                    "text": parsed.text,
-                                    "isFinal": True,
-                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                                },
-                            }
+                                "text": parsed.text,
+                                "isFinal": True,
+                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                            },
                         )
                         assistant_text = await session_service.generate_text_reply_fallback(
                             session_id,
@@ -274,25 +389,21 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                             fallback_text,
                         )
                         session_service.record_assistant_text(session_id, assistant_text, parsed.timestamp)
-                        await ws.send_json(
+                        await send_ws_event(
+                            "assistant.transcript",
                             {
-                                "type": "assistant.transcript",
-                                "payload": {
-                                    "text": assistant_text,
-                                    "isFinal": True,
-                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                                },
-                            }
+                                "text": assistant_text,
+                                "isFinal": True,
+                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                            },
                         )
-                        await ws.send_json(
+                        await send_ws_event(
+                            "assistant.audio.chunk",
                             {
-                                "type": "assistant.audio.chunk",
-                                "payload": {
-                                    "mimeType": "audio/pcm",
-                                    "data": generate_silence_chunk(),
-                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                                },
-                            }
+                                "mimeType": "audio/pcm",
+                                "data": generate_silence_chunk(),
+                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                            },
                         )
                 elif event_type == "audio.input.chunk":
                     parsed = parse_payload(AudioInputChunkPayload, payload)
@@ -308,14 +419,13 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                 elif event_type == "image.input.frame":
                     parsed = parse_payload(ImageInputFramePayload, payload)
                     if not session_service.is_visual_assist_active(session_id):
-                        await ws.send_json(
+                        await send_ws_event(
+                            "error",
                             {
-                                "type": "error",
-                                "payload": {
-                                    "code": "VISUAL_ASSIST_INACTIVE",
-                                    "message": "visual_assist.start is required before image.input.frame",
-                                },
-                            }
+                                "code": "VISUAL_ASSIST_INACTIVE",
+                                "message": "visual_assist.start is required before image.input.frame",
+                            },
+                            error_code="VISUAL_ASSIST_INACTIVE",
                         )
                         continue
                     session_service.remember_image_frame(
@@ -338,42 +448,57 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                 elif event_type == "session.pause":
                     session_service.update_status(session_id, SessionStatus.paused)
                     await live_bridge.close_session(session_id)
-                    await ws.send_json(
-                        {
-                            "type": "session.status",
-                            "payload": model_json(SessionStatusPayload(status=SessionStatus.paused)),
-                        }
+                    await send_ws_event(
+                        "session.status",
+                        model_json(SessionStatusPayload(status=SessionStatus.paused)),
+                        status=SessionStatus.paused.value,
                     )
                 elif event_type == "session.resume":
                     session_service.update_status(session_id, SessionStatus.active)
-                    await ws.send_json(
-                        {
-                            "type": "session.status",
-                            "payload": model_json(SessionStatusPayload(status=SessionStatus.active)),
-                        }
+                    await send_ws_event(
+                        "session.status",
+                        model_json(SessionStatusPayload(status=SessionStatus.active)),
+                        status=SessionStatus.active.value,
                     )
                 elif event_type == "session.end":
                     session_service.update_status(session_id, SessionStatus.ended)
                     await live_bridge.close_session(session_id)
-                    await ws.send_json(
-                        {
-                            "type": "session.status",
-                            "payload": model_json(SessionStatusPayload(status=SessionStatus.ended)),
-                        }
+                    await send_ws_event(
+                        "session.status",
+                        model_json(SessionStatusPayload(status=SessionStatus.ended)),
+                        status=SessionStatus.ended.value,
                     )
                     break
                 else:
-                    await ws.send_json(
-                        {
-                            "type": "error",
-                            "payload": {"code": "UNKNOWN_EVENT", "message": f"Unsupported event {event_type}"},
-                        }
+                    await send_ws_event(
+                        "error",
+                        {"code": "UNKNOWN_EVENT", "message": f"Unsupported event {event_type}"},
+                        error_code="UNKNOWN_EVENT",
                     )
             except ApiError as exc:
-                await ws.send_json({"type": "error", "payload": {"code": exc.code, "message": exc.message}})
+                logger.warning(
+                    "LIVE_SESSION_EVENT_ERROR %s",
+                    format_log_fields(
+                        request_id=request_id,
+                        session_id=session_id,
+                        ws_id=ws_id,
+                        ws_event=event_type,
+                        error_code=exc.code,
+                        error_message=exc.message,
+                    ),
+                )
+                await send_ws_event("error", {"code": exc.code, "message": exc.message}, error_code=exc.code)
     finally:
         await live_bridge.close_session(session_id)
         await live_manager.unregister(session_id, ws)
+        log_live(
+            "LIVE_WS_CLOSE",
+            request_id=request_id,
+            session_id=session_id,
+            ws_id=ws_id,
+            close_code=ws.close_code,
+            remaining_connections=len(live_manager.connections.get(session_id, set())),
+        )
 
     return ws
 
