@@ -291,4 +291,4 @@ class ErrorPayload(ApiModel):
 
 class WebsocketEnvelope(ApiModel):
     type: str
-    payload: dict[str, Any]
+    payload: dict[str, Any] | None

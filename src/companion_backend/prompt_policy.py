@@ -24,6 +24,7 @@ def build_system_prompt(
         f"destination={destination_line}; "
         f"nearby_places={', '.join(context.nearby_places)}; "
         f"nearby_activities={', '.join(context.nearby_activities)}; "
+        f"nearby_events={', '.join(context.nearby_events) or 'none'}; "
         f"recent_transcript={transcript_summary}"
     )
 
@@ -46,6 +47,12 @@ def _length_suffix(response_length: ResponseLength, extra: str) -> str:
     return f" {extra} Keep moving and I’ll layer in more context as things change."
 
 
+def _event_suffix(context: ContextSnapshot) -> str:
+    if not context.nearby_events:
+        return ""
+    return f" Upcoming nearby events include {', '.join(context.nearby_events[:2])}."
+
+
 def build_location_response(
     settings: UserSettings,
     context: ContextSnapshot,
@@ -57,7 +64,7 @@ def build_location_response(
     )
     if destination_label:
         base += f" I’m also keeping {destination_label} in frame."
-    return base + _length_suffix(
+    return base + _event_suffix(context) + _length_suffix(
         settings.response_length,
         f"Nearby activity context includes {', '.join(context.nearby_activities[:2])}.",
     )
@@ -71,9 +78,25 @@ def build_destination_response(
     return (
         f"{_style_prefix(settings)}: destination updated to {destination_label}. "
         f"I’ll bias the companion toward {', '.join(context.nearby_places[:2])} and { _join_focus(settings) }."
+        + _event_suffix(context)
         + _length_suffix(
             settings.response_length,
             f"I’m also tracking {', '.join(context.nearby_activities[:2])}.",
+        )
+    )
+
+
+def build_destination_cleared_response(
+    settings: UserSettings,
+    context: ContextSnapshot,
+) -> str:
+    return (
+        f"{_style_prefix(settings)}: destination cleared. "
+        f"I’ll stay oriented to {', '.join(context.nearby_places[:2])} and { _join_focus(settings) }."
+        + _event_suffix(context)
+        + _length_suffix(
+            settings.response_length,
+            f"I’m still tracking {', '.join(context.nearby_activities[:2])}.",
         )
     )
 
@@ -94,6 +117,7 @@ def build_text_response(
     return (
         f"{_style_prefix(settings)}: on “{user_text}”, the clearest read is around {context.nearby_places[0]}. "
         f"I’ll keep the answer tuned for { _join_focus(settings) }.{destination_line}{visual_line}"
+        + _event_suffix(context)
         + _length_suffix(
             settings.response_length,
             f"Relevant nearby activity includes {', '.join(context.nearby_activities[:2])}.",

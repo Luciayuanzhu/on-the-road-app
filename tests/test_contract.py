@@ -16,6 +16,18 @@ def make_config(tmp_path: Path) -> AppConfig:
         public_base_url="http://localhost:8080",
         summary_delay_seconds=0.15,
         location_response_cooldown_seconds=0,
+        gemini_api_key=None,
+        gemini_model="gemini-2.5-flash",
+        google_places_api_key=None,
+        ticketmaster_api_key=None,
+        gemini_base_url="https://generativelanguage.googleapis.com",
+        google_places_base_url="https://places.googleapis.com",
+        ticketmaster_base_url="https://app.ticketmaster.com/discovery/v2",
+        google_places_language_code="en",
+        gemini_live_model="gemini-2.5-flash-native-audio-preview-12-2025",
+        gemini_live_ws_url="wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent",
+        gemini_live_audio_idle_seconds=0.05,
+        ticketmaster_event_cache_seconds=180,
     )
 
 

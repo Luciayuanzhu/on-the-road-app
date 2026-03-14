@@ -33,6 +33,7 @@ from .schemas import (
 from .services import (
     ApiError,
     BookmarkService,
+    GeminiLiveBridge,
     IdentityService,
     LiveSessionManager,
     SessionService,
@@ -41,7 +42,7 @@ from .services import (
     generate_silence_chunk,
     parse_payload,
 )
-from .providers import ContextProvider
+from .providers import ContextProvider, GeminiClient
 
 CONFIG_KEY = web.AppKey("config", AppConfig)
 ENGINE_KEY = web.AppKey("db_engine", Engine)
@@ -52,6 +53,7 @@ SETTINGS_SERVICE_KEY = web.AppKey("settings_service", SettingsService)
 SESSION_SERVICE_KEY = web.AppKey("session_service", SessionService)
 SUMMARY_SERVICE_KEY = web.AppKey("summary_service", SummaryService)
 BOOKMARK_SERVICE_KEY = web.AppKey("bookmark_service", BookmarkService)
+LIVE_BRIDGE_KEY = web.AppKey("live_bridge", GeminiLiveBridge)
 
 
 def model_json(model) -> dict:
@@ -128,7 +130,7 @@ async def get_settings(request: web.Request) -> web.Response:
 async def create_bookmark(request: web.Request) -> web.Response:
     body = await request.json()
     payload = BookmarkCreateRequest.model_validate(body)
-    response = request.app[BOOKMARK_SERVICE_KEY].create(payload)
+    response = await request.app[BOOKMARK_SERVICE_KEY].create(payload)
     return web.json_response(model_json(response), status=201)
 
 
@@ -165,6 +167,7 @@ async def live_session(request: web.Request) -> web.StreamResponse:
     live_manager: LiveSessionManager = request.app[LIVE_MANAGER_KEY]
     await live_manager.register(session_id, ws)
     session_service: SessionService = request.app[SESSION_SERVICE_KEY]
+    live_bridge: GeminiLiveBridge = request.app[LIVE_BRIDGE_KEY]
 
     try:
         async for message in ws:
@@ -193,14 +196,17 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                             "payload": model_json(SessionStatusPayload(status=SessionStatus.active)),
                         }
                     )
+                    await live_bridge.refresh_if_active(session_id)
                 elif event_type == "session.update_settings":
                     parsed = parse_payload(SessionUpdateSettingsPayload, payload)
                     hint = await session_service.update_settings(session_id, parsed.settings)
                     await ws.send_json({"type": "context.hint", "payload": model_json(hint)})
+                    await live_bridge.restart_session(session_id)
                 elif event_type == "location.update":
                     parsed = parse_payload(LocationUpdatePayload, payload)
                     assistant_text, hint = await session_service.update_location(session_id, parsed)
                     await ws.send_json({"type": "context.hint", "payload": model_json(hint)})
+                    await live_bridge.refresh_if_active(session_id)
                     if assistant_text:
                         session_service.record_assistant_text(session_id, assistant_text, parsed.timestamp)
                         await ws.send_json(
@@ -224,8 +230,9 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                             }
                         )
                 elif event_type == "destination.update":
-                    parsed = parse_payload(Destination, payload)
+                    parsed = parse_payload(Destination, payload) if payload is not None else None
                     assistant_text = await session_service.update_destination(session_id, parsed)
+                    await live_bridge.restart_session(session_id)
                     session_service.record_assistant_text(session_id, assistant_text, now)
                     await ws.send_json(
                         {
@@ -239,42 +246,62 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                     )
                 elif event_type == "text.input":
                     parsed = parse_payload(TextInputPayload, payload)
-                    session_service.record_user_text(session_id, parsed.text, parsed.timestamp)
-                    await ws.send_json(
-                        {
-                            "type": "user.transcript",
-                            "payload": {
-                                "text": parsed.text,
-                                "isFinal": True,
-                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                            },
-                        }
+                    fallback_text = await session_service.prepare_text_turn(session_id, parsed.text)
+                    await live_bridge.refresh_if_active(session_id)
+                    sent_to_live = await live_bridge.send_text_turn(
+                        session_id,
+                        parsed.text,
+                        parsed.timestamp,
                     )
-                    assistant_text = await session_service.generate_text_reply(session_id, parsed.text)
-                    session_service.record_assistant_text(session_id, assistant_text, parsed.timestamp)
-                    await ws.send_json(
-                        {
-                            "type": "assistant.transcript",
-                            "payload": {
-                                "text": assistant_text,
-                                "isFinal": True,
-                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                            },
-                        }
-                    )
-                    await ws.send_json(
-                        {
-                            "type": "assistant.audio.chunk",
-                            "payload": {
-                                "mimeType": "audio/pcm",
-                                "data": generate_silence_chunk(),
-                                "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
-                            },
-                        }
-                    )
+                    if not sent_to_live:
+                        # Fallback is only allowed when the active Gemini Live session cannot be
+                        # established or write-path fails. This keeps text and audio on the same
+                        # real-time source whenever Live is healthy.
+                        session_service.record_user_text(session_id, parsed.text, parsed.timestamp)
+                        await ws.send_json(
+                            {
+                                "type": "user.transcript",
+                                "payload": {
+                                    "text": parsed.text,
+                                    "isFinal": True,
+                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                                },
+                            }
+                        )
+                        assistant_text = await session_service.generate_text_reply_fallback(
+                            session_id,
+                            parsed.text,
+                            fallback_text,
+                        )
+                        session_service.record_assistant_text(session_id, assistant_text, parsed.timestamp)
+                        await ws.send_json(
+                            {
+                                "type": "assistant.transcript",
+                                "payload": {
+                                    "text": assistant_text,
+                                    "isFinal": True,
+                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                                },
+                            }
+                        )
+                        await ws.send_json(
+                            {
+                                "type": "assistant.audio.chunk",
+                                "payload": {
+                                    "mimeType": "audio/pcm",
+                                    "data": generate_silence_chunk(),
+                                    "timestamp": parsed.timestamp.isoformat().replace("+00:00", "Z"),
+                                },
+                            }
+                        )
                 elif event_type == "audio.input.chunk":
                     parsed = parse_payload(AudioInputChunkPayload, payload)
                     session_service.record_audio_event(session_id, parsed.timestamp)
+                    await live_bridge.send_audio_chunk(
+                        session_id,
+                        parsed.mime_type,
+                        parsed.data,
+                    )
                 elif event_type == "visual_assist.start":
                     parse_payload(VisualAssistPayload, payload)
                     session_service.set_visual_assist(session_id, True)
@@ -291,12 +318,26 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                             }
                         )
                         continue
+                    session_service.remember_image_frame(
+                        session_id,
+                        parsed.mime_type,
+                        parsed.data,
+                        parsed.timestamp,
+                    )
                     session_service.record_image_event(session_id, parsed.timestamp)
+                    await live_bridge.send_image_frame(
+                        session_id,
+                        parsed.mime_type,
+                        parsed.data,
+                    )
                 elif event_type == "visual_assist.stop":
                     parse_payload(VisualAssistPayload, payload)
                     session_service.set_visual_assist(session_id, False)
+                    session_service.clear_image_frame(session_id)
+                    await live_bridge.restart_session(session_id)
                 elif event_type == "session.pause":
                     session_service.update_status(session_id, SessionStatus.paused)
+                    await live_bridge.close_session(session_id)
                     await ws.send_json(
                         {
                             "type": "session.status",
@@ -313,6 +354,7 @@ async def live_session(request: web.Request) -> web.StreamResponse:
                     )
                 elif event_type == "session.end":
                     session_service.update_status(session_id, SessionStatus.ended)
+                    await live_bridge.close_session(session_id)
                     await ws.send_json(
                         {
                             "type": "session.status",
@@ -330,6 +372,7 @@ async def live_session(request: web.Request) -> web.StreamResponse:
             except ApiError as exc:
                 await ws.send_json({"type": "error", "payload": {"code": exc.code, "message": exc.message}})
     finally:
+        await live_bridge.close_session(session_id)
         await live_manager.unregister(session_id, ws)
 
     return ws
@@ -344,19 +387,30 @@ def create_app(config: AppConfig | None = None) -> web.Application:
     live_manager = LiveSessionManager()
     identity_service = IdentityService(session_factory)
     settings_service = SettingsService(session_factory, identity_service)
+    context_provider = ContextProvider(config)
+    gemini_client = GeminiClient(config)
     session_service = SessionService(
         config=config,
         session_factory=session_factory,
         identity_service=identity_service,
         settings_service=settings_service,
-        context_provider=ContextProvider(),
+        context_provider=context_provider,
+        gemini_client=gemini_client,
     )
-    summary_service = SummaryService(config, session_factory, live_manager)
+    summary_service = SummaryService(
+        config,
+        session_factory,
+        live_manager,
+        context_provider,
+        gemini_client,
+    )
+    live_bridge = GeminiLiveBridge(config, live_manager, session_service)
     bookmark_service = BookmarkService(
         session_factory,
         identity_service,
         session_service,
         summary_service,
+        context_provider,
     )
 
     app[CONFIG_KEY] = config
@@ -368,8 +422,10 @@ def create_app(config: AppConfig | None = None) -> web.Application:
     app[SESSION_SERVICE_KEY] = session_service
     app[SUMMARY_SERVICE_KEY] = summary_service
     app[BOOKMARK_SERVICE_KEY] = bookmark_service
+    app[LIVE_BRIDGE_KEY] = live_bridge
 
     async def dispose_engine(app: web.Application) -> None:
+        await app[LIVE_BRIDGE_KEY].close()
         app[ENGINE_KEY].dispose()
 
     app.on_cleanup.append(dispose_engine)
