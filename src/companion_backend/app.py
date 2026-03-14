@@ -73,6 +73,10 @@ def log_live(event: str, **fields) -> None:
     logger.info("%s%s", event, f" {details}" if details else "")
 
 
+def scalar_value(value):
+    return getattr(value, "value", value)
+
+
 @web.middleware
 async def request_id_middleware(request: web.Request, handler):
     request["request_id"] = request.headers.get("X-Request-ID", str(uuid4()))
@@ -130,7 +134,7 @@ async def create_session(request: web.Request) -> web.Response:
         session_id=response.session_id,
         user_id=payload.user_id,
         device_id=payload.device_id,
-        status=response.status.value,
+        status=scalar_value(response.status),
     )
     return web.json_response(model_json(response), status=201)
 
